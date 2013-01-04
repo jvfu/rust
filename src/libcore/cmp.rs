@@ -20,6 +20,8 @@ and `Eq` to overload the `==` and `!=` operators.
 
 */
 
+pub enum Order { LT, EQ, GT }
+
 /**
 * Trait for values that can be compared for equality
 * and inequality.
