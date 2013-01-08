@@ -1213,7 +1213,7 @@ pub fn rposition_between<T>(v: &[T], start: uint, end: uint,
  * Returns the index where the comparator returned `Equal`, or `None` if
  * not found.
  */
-pub pure fn bsearch<T>(v: &[T], f: &fn(&T) -> Ordering) -> Option<uint> {
+pub fn bsearch<T>(v: &[T], f: &fn(&T) -> Ordering) -> Option<uint> {
     let mut base : uint = 0;
     let mut lim : uint = v.len();
 
@@ -1237,7 +1237,7 @@ pub pure fn bsearch<T>(v: &[T], f: &fn(&T) -> Ordering) -> Option<uint> {
  *
  * Returns the index of the element or None if not found.
  */
-pub pure fn bsearch_elem<T:TotalOrd>(v: &[T], x: &T) -> Option<uint> {
+pub fn bsearch_elem<T:TotalOrd>(v: &[T], x: &T) -> Option<uint> {
     bsearch(v, |p| p.cmp(x))
 }
 
