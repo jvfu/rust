@@ -123,7 +123,7 @@ struct Task {
 struct AnnihilateStats {
     n_total_boxes: uint,
     n_unique_boxes: uint,
-    n_bytes_freed: uint
+    n_managed_bytes: uint
 }
 
 unsafe fn each_live_alloc(f: &fn(box: *mut BoxRepr, uniq: bool) -> bool) {
@@ -169,35 +169,24 @@ pub unsafe fn annihilate() {
     let mut stats = AnnihilateStats {
         n_total_boxes: 0,
         n_unique_boxes: 0,
-        n_bytes_freed: 0
+        n_managed_bytes: 0
     };
 
-    // Pass 1: Make all boxes immortal.
     for each_live_alloc |box, uniq| {
         stats.n_total_boxes += 1;
+        stats.n_managed_bytes +=
+            (*((*box).header.type_desc)).size
+            + sys::size_of::<BoxRepr>();
         if uniq {
             stats.n_unique_boxes += 1;
-        } else {
-            (*box).header.ref_count = managed::raw::RC_IMMORTAL;
         }
     }
 
-    // Pass 2: Drop all boxes.
-    for each_live_alloc |box, uniq| {
-        if !uniq {
-            let tydesc: *TypeDesc = transmute(copy (*box).header.type_desc);
-            let drop_glue: DropGlue = transmute(((*tydesc).drop_glue, 0));
-            drop_glue(to_unsafe_ptr(&tydesc), transmute(&(*box).data));
-        }
-    }
-
-    // Pass 3: Free all boxes.
-    for each_live_alloc |box, uniq| {
-        if !uniq {
-            stats.n_bytes_freed +=
-                (*((*box).header.type_desc)).size
-                + sys::size_of::<BoxRepr>();
-            local_free(transmute(box));
+    do drop_boxes |step| {
+        for each_live_alloc |box, uniq| {
+            if !uniq {
+                step(box)
+            }
         }
     }
 
@@ -209,9 +198,39 @@ pub unsafe fn annihilate() {
         dbg.write_uint(stats.n_total_boxes);
         dbg.write_str("\n  unique_boxes: ");
         dbg.write_uint(stats.n_unique_boxes);
-        dbg.write_str("\n  bytes_freed: ");
-        dbg.write_uint(stats.n_bytes_freed);
+        dbg.write_str("\n  managed_bytes: ");
+        dbg.write_uint(stats.n_managed_bytes);
         dbg.write_str("\n");
+    }
+}
+
+unsafe fn drop_boxes(each: fn(fn(*mut BoxRepr))) {
+    use managed;
+    use rt;
+
+    do each |boxp| {
+        let box: &mut BoxRepr = transmute(boxp);
+        debug!("(drop boxes) pass #1: setting immortal: %x",
+               transmute(boxp));
+        box.header.ref_count = managed::raw::RC_IMMORTAL;
+    }
+
+    do each |boxp| {
+        let box: &BoxRepr = transmute(boxp);
+        let tydesc: *TypeDesc = transmute(box.header.type_desc);
+        let drop_glue: DropGlue = transmute(((*tydesc).drop_glue, 0));
+        debug!("(drop boxes) pass #2: calling drop glue %x on box %x",
+               (*tydesc).drop_glue,
+               transmute(box));
+        drop_glue(to_unsafe_ptr(&tydesc),
+                  transmute(&(*box).data));
+    }
+
+    do each |boxp| {
+        let box: &BoxRepr = transmute(boxp);
+        debug!("(drop boxes) pass #3: freeing box %x",
+               transmute(box));
+        rt::local_free(transmute(box));
     }
 }
 
