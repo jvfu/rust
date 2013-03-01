@@ -260,12 +260,10 @@ pub mod raw {
             rustrt::vec_reserve_shared_actual(sys::get_type_desc::<T>(),
                                               ptr, n as libc::size_t);
             let post = *ptr;
-            if pre != post {
-                Gc::get_task_gc().note_realloc(pre as uint,
-                                               post as uint,
-                                               (*post).unboxed.alloc + 
-                                               size_of::<VecRepr>());
-            }
+            Gc::get_task_gc().note_realloc(pre as uint,
+                                           post as uint,
+                                           (*post).unboxed.alloc +
+                                           size_of::<VecRepr>());
         }
     }
 
