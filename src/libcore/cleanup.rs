@@ -712,6 +712,9 @@ pub impl Gc {
                 loop;
             }
             let box: &mut BoxRepr = transmute(boxp);
+            if box.header.ref_count == RC_MANAGED_UNIQUE {
+                loop;
+            }
             if debug_flag {
                 Gc::write_str_hex("(drop boxes) pass #1: setting immortal",
                                   boxp as uint);
@@ -726,6 +729,9 @@ pub impl Gc {
                 loop;
             }
             let box: &BoxRepr = transmute(boxp);
+            if box.header.ref_count == RC_MANAGED_UNIQUE {
+                loop;
+            }
             let tydesc: *TypeDesc = transmute(box.header.type_desc);
             let drop_glue: DropGlue = transmute(((*tydesc).drop_glue, 0));
             if debug_flag {
@@ -743,6 +749,9 @@ pub impl Gc {
                 loop;
             }
             let box: &BoxRepr = transmute(boxp);
+            if box.header.ref_count == RC_MANAGED_UNIQUE {
+                loop;
+            }
             if debug_flag {
                 Gc::write_str_hex("(drop boxes) pass #3: freeing",
                                   boxp as uint);
@@ -878,10 +887,6 @@ pub impl Gc {
                 if record.is_marked {
                     loop;
                 }
-                let box: &BoxRepr = transmute(ptr);
-                if box.header.ref_count == RC_MANAGED_UNIQUE {
-                    loop;
-                }
                 step(transmute(ptr));
             }
         }
@@ -923,10 +928,7 @@ pub impl Gc {
                           self.debug_gc,
                           &mut self.free_buffer) |step| {
             for self.heap.each_mut |ptr, _| {
-                let box: &BoxRepr = transmute(ptr);
-                if box.header.ref_count != RC_MANAGED_UNIQUE {
-                    step(transmute(ptr));
-                }
+                step(transmute(ptr));
             }
         }
         for self.free_buffer.each_mut |ptr, _| {
