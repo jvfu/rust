@@ -904,18 +904,21 @@ pub impl Gc {
         // NB: need this here before we lock down the GC, to make sure
         // TLS is initialized; easiest approach. It allocates a @Dvec.
         do each_retained_ptr(transmute(self.task)) |_| { }
-
+        self.debug_str("gc starting\n");
         self.gc_in_progress = true;
         self.check_consistency("pre-gc");
         self.mark();
         self.sweep();
         self.check_consistency("post-gc");
         self.gc_in_progress = false; 
+        self.debug_str("gc finished\n");
     }
 
     unsafe fn annihilate(&mut self) {
+        self.debug_str("annihilation starting\n");
         self.check_consistency("pre-annihilate");
         self.gc_in_progress = true;
+
         do Gc::drop_boxes(true,
                           self.debug_gc,
                           &mut self.free_buffer) |step| {
@@ -932,6 +935,7 @@ pub impl Gc {
         }
         self.gc_in_progress = false;
         self.check_consistency("post-annihilate");
+        self.debug_str("annihilation finished\n");
     }
 }
 

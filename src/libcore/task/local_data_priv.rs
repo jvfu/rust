@@ -84,7 +84,8 @@ pub unsafe fn each_retained_ptr(task: *rust_task,
     let map = get_task_local_map(task);
 
     // NB: the map is a @Dvec too.
-    cb(cast::transmute(map));
+    let p: **libc::c_void = cast::transmute(&map);
+    cb(*p);
 
     for map.each |elt| {
         match elt {
@@ -95,8 +96,8 @@ pub unsafe fn each_retained_ptr(task: *rust_task,
                 // Existential boxes are (vtbl,box) pairs.
                 // We want to mention the 2nd one; we mention
                 // both here just to be safe.
-                let pair: (*libc::c_void,
-                           *libc::c_void) = cast::transmute(c);
+                let pair: &(*libc::c_void,
+                            *libc::c_void) = cast::transmute(&c);
                 cb(pair.first());
                 cb(pair.second());
             }
