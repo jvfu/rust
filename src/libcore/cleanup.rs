@@ -27,7 +27,7 @@ use task::each_retained_ptr;
 use uint;
 use vec;
 use unstable::exchange_alloc;
-use unstable::intrinsics::ctpop64;
+use unstable::intrinsics::ctlz64;
 
 /*
 * A trie for holding pointers.
@@ -411,6 +411,9 @@ pub struct Gc {
     threshold: uint,
 
     n_collections: uint,
+    n_ns_marking: Stat,
+    n_ns_sweeping: Stat,
+    n_ns_total: Stat,
     n_boxes_marked: Stat,
     n_bytes_marked: Stat,
     n_boxes_swept: Stat,
@@ -496,6 +499,9 @@ pub impl Gc {
             threshold: 1024,
 
             n_collections: 0,
+            n_ns_marking: Stat::new(),
+            n_ns_sweeping: Stat::new(),
+            n_ns_total: Stat::new(),
             n_boxes_marked: Stat::new(),
             n_bytes_marked: Stat::new(),
             n_boxes_swept: Stat::new(),
@@ -563,27 +569,54 @@ pub impl Gc {
         e.write_str("\n");
     }
 
-    fn report_stat(&self, s: &str, t: &Stat) {
-        Gc::stderr_fd().write_str("    ");
-        Gc::write_str_uint(s, t.total as uint);
+    static fn report_stat(s: &str, t: &mut Stat) {
+        let e = Gc::stderr_fd();
+        e.write_str("    ");
+        e.write_str(s);
+        e.write_str(": ");
+        e.write_uint(t.curr as uint);
+        t.flush();
+        e.write_str(" curr, ");
+        e.write_uint(t.total as uint);
+        e.write_str(" total (hist:");
+        for vec::eachi(t.hist) |i, elt| {
+            if *elt != 0 {
+                e.write_str(" ");
+                e.write_uint(i);
+                e.write_str(":");
+                e.write_uint(*elt as uint);
+            }
+        }
+        e.write_str(")\n");
     }
 
-    fn report_stats() {
+    fn report_stats(&mut self, phase: &str) {
         if self.report_gc_stats {
+            let e = Gc::stderr_fd();
+            e.write_str("\n--- ");
+            e.write_str(phase);
+            e.write_str(" stats ---\n");
             Gc::write_str_uint("    n_collections",
                                self.n_collections);
-            self.report_stat("n_boxes_marked",
-                             &self.n_boxes_marked);
-            self.report_stat("n_bytes_marked",
-                             &self.n_bytes_marked);
-            self.report_stat("n_boxes_swept",
-                             &self.n_boxes_swept);
-            self.report_stat("n_bytes_swept",
-                             &self.n_bytes_swept);
-            self.report_stat("n_boxes_annihilated",
-                             &self.n_boxes_annihilated);
-            self.report_stat("n_bytes_annihilated",
-                             &self.n_bytes_annihilated);
+            Gc::report_stat("n_ns_marking",
+                            &mut self.n_ns_marking);
+            Gc::report_stat("n_ns_sweeping",
+                            &mut self.n_ns_sweeping);
+            Gc::report_stat("n_ns_total",
+                            &mut self.n_ns_total);
+
+            Gc::report_stat("n_boxes_marked",
+                            &mut self.n_boxes_marked);
+            Gc::report_stat("n_bytes_marked",
+                            &mut self.n_bytes_marked);
+            Gc::report_stat("n_boxes_swept",
+                            &mut self.n_boxes_swept);
+            Gc::report_stat("n_bytes_swept",
+                            &mut self.n_bytes_swept);
+            Gc::report_stat("n_boxes_annihilated",
+                            &mut self.n_boxes_annihilated);
+            Gc::report_stat("n_bytes_annihilated",
+                            &mut self.n_bytes_annihilated);
         }
     }
 
@@ -704,10 +737,12 @@ pub impl Gc {
                   
     static unsafe fn drop_boxes(actually_drop: bool,
                                 debug_flag: bool,
+                                boxes_dropped: &mut Stat,
+                                bytes_dropped: &mut Stat,
                                 free_buffer: &mut TrieMap<()>,
-                                each: fn(fn(*mut BoxRepr) -> bool)) {
+                                each: fn(fn(*mut BoxRepr, uint) -> bool)) {
         
-        for each |boxp| {
+        for each |boxp, _size| {
             if free_buffer.contains(boxp as uint) {
                 loop;
             }
@@ -724,7 +759,7 @@ pub impl Gc {
             }
         }
 
-        for each |boxp| {
+        for each |boxp, _size| {
             if free_buffer.contains(boxp as uint) {
                 loop;
             }
@@ -744,7 +779,7 @@ pub impl Gc {
             }
         }
 
-        for each |boxp| {
+        for each |boxp, size| {
             if free_buffer.contains(boxp as uint) {
                 loop;
             }
@@ -757,6 +792,8 @@ pub impl Gc {
                                   boxp as uint);
             }
             if actually_drop {
+                boxes_dropped.curr += 1;
+                bytes_dropped.curr += size as i64;
                 rust_upcall_free(transmute(box));
                 free_buffer.insert(boxp as uint, ());
             }
@@ -800,6 +837,10 @@ pub impl Gc {
             ..record
         };
         self.heap.insert(obj, record);
+
+        self.n_boxes_marked.curr += 1;
+        self.n_bytes_marked.curr += record.size as i64;
+
         let adj = size_of::<BoxHeaderRepr>();
         self.mark_range("marking object", level + 1,
                         obj + adj, record.size - adj);
@@ -882,12 +923,14 @@ pub impl Gc {
     unsafe fn sweep(&mut self) {        
         do Gc::drop_boxes(self.actually_gc,
                           self.debug_gc,
+                          &mut self.n_boxes_swept,
+                          &mut self.n_bytes_swept,
                           &mut self.free_buffer) |step| {
             for self.heap.each_mut |ptr, record| {
                 if record.is_marked {
                     loop;
                 }
-                step(transmute(ptr));
+                step(transmute(ptr), record.size);
             }
         }
 
@@ -906,17 +949,44 @@ pub impl Gc {
     }
 
     unsafe fn gc(&mut self) {
+
+        let mut start = 0;
+        let mut end = 0;
+        let mut mark_start = 0;
+        let mut mark_end = 0;
+        let mut sweep_start = 0;
+        let mut sweep_end = 0;
+
+        precise_time_ns(&mut start);
+
         // NB: need this here before we lock down the GC, to make sure
         // TLS is initialized; easiest approach. It allocates a @Dvec.
         do each_retained_ptr(transmute(self.task)) |_| { }
+
         self.debug_str("gc starting\n");
         self.gc_in_progress = true;
         self.check_consistency("pre-gc");
+
+        precise_time_ns(&mut mark_start);
         self.mark();
+        precise_time_ns(&mut mark_end);
+
+        precise_time_ns(&mut sweep_start);
         self.sweep();
+        precise_time_ns(&mut sweep_end);
+
         self.check_consistency("post-gc");
         self.gc_in_progress = false; 
         self.debug_str("gc finished\n");
+
+        self.n_collections += 1;
+        precise_time_ns(&mut end);
+
+        self.n_ns_marking.curr += (mark_end - mark_start) as i64;
+        self.n_ns_sweeping.curr += (sweep_end - sweep_start) as i64;
+        self.n_ns_total.curr += (end - start) as i64;
+
+        self.report_stats("gc");
     }
 
     unsafe fn annihilate(&mut self) {
@@ -926,9 +996,11 @@ pub impl Gc {
 
         do Gc::drop_boxes(true,
                           self.debug_gc,
+                          &mut self.n_boxes_annihilated,
+                          &mut self.n_bytes_annihilated,
                           &mut self.free_buffer) |step| {
-            for self.heap.each_mut |ptr, _| {
-                step(transmute(ptr));
+            for self.heap.each_mut |ptr, record| {
+                step(transmute(ptr), record.size);
             }
         }
         for self.free_buffer.each_mut |ptr, _| {
@@ -938,6 +1010,7 @@ pub impl Gc {
         self.gc_in_progress = false;
         self.check_consistency("post-annihilate");
         self.debug_str("annihilation finished\n");
+        self.report_stats("annihilation");
     }
 }
 
@@ -951,7 +1024,7 @@ pub impl Stat {
     fn flush(&mut self) {
         self.total += self.curr;
         unsafe {
-            self.hist[ctpop64(self.curr)] += 1;
+            self.hist[64 - ctlz64(self.curr)] += 1;
         }
         self.curr = 0;
     }
@@ -990,6 +1063,8 @@ pub fn gc() {
 
 #[link_name = "rustrt"]
 extern {
+    fn precise_time_ns(ns: &mut u64);
+
     #[rust_stack]
     // FIXME (#4386): Unable to make following method private.
     fn rust_get_task() -> *c_void;
