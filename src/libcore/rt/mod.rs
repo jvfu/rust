@@ -11,6 +11,7 @@
 #[doc(hidden)];
 
 use libc::c_char;
+pub use self::context::swap_registers;
 
 // Some basic logging
 macro_rules! rtdebug_ (

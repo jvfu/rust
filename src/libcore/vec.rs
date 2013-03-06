@@ -77,7 +77,7 @@ pub fn reserve<T>(v: &mut ~[T], n: uint) {
             let td = sys::get_type_desc::<T>();
             if ((**ptr).box_header.ref_count ==
                 managed::raw::RC_MANAGED_UNIQUE) {
-                let managed : &mut @[const T] = transmute(ptr);
+                let managed : &mut @[T] = transmute(ptr);
                 at_vec::raw::reserve::<T>(managed, n);
             } else {
                 rustrt::vec_reserve_shared(td, ptr, n as libc::size_t);

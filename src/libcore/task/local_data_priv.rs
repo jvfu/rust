@@ -80,7 +80,7 @@ unsafe fn get_task_local_map(task: *rust_task) -> TaskLocalMap {
 // Helper for use by conservative gc. We don't know what TLS is but
 // we consider them all roots.
 pub unsafe fn each_retained_ptr(task: *rust_task,
-                                cb: fn(*libc::c_void)) {
+                                cb: &fn(*libc::c_void)) {
     let map = get_task_local_map(task);
 
     // NB: the map is a @Dvec too.

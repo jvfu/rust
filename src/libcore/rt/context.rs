@@ -83,8 +83,8 @@ pub impl Context {
     }
 }
 
-extern {
-    fn swap_registers(out_regs: *mut Registers, in_regs: *Registers);
+pub extern {
+    pub fn swap_registers(out_regs: *mut Registers, in_regs: *Registers);
 }
 
 #[cfg(target_arch = "x86")]

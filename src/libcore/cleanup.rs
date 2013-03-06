@@ -13,10 +13,8 @@
 
 use cast::transmute;
 use io::{fd_t, WriterUtil};
-use io;
 use libc::{c_char, c_void, c_uint, intptr_t, uintptr_t, size_t};
 use libc;
-use kinds::Copy;
 use managed::raw::{BoxRepr, BoxHeaderRepr,
                    RC_MANAGED_UNIQUE, RC_IMMORTAL};
 use option::{Option,Some,None};
@@ -28,242 +26,9 @@ use uint;
 use vec;
 use unstable::exchange_alloc;
 use unstable::intrinsics::ctlz64;
-
-/*
-* A trie for holding pointers.
-*/
-
-
-
-// FIXME: need to manually update TrieNode when SHIFT changes
-const SHIFT: uint = 4;
-const SIZE: uint = 1 << SHIFT;
-const MASK: uint = SIZE - 1;
-
-enum Child<T> {
-    Internal(~TrieNode<T>),
-    External(uint,T),
-    Nothing
-}
-
-pub struct TrieMap<T> {
-    priv root: TrieNode<T>,
-    priv length: uint
-}
-
-impl<T:Copy> TrieMap<T> {
-    static pure fn new() -> TrieMap<T> {
-        TrieMap {
-            root: TrieNode::new(),
-            length: 0
-        }
-    }
-
-    fn clear(&mut self) {
-        self.root = TrieNode::new();
-        self.length = 0;
-    }
-
-    pure fn prev(&self, key: uint) ->
-        Option<(uint,&self/T)> {
-        prev(&self.root, key, 0)
-    }
-
-    pure fn next(&self, key: uint) ->
-        Option<(uint,&self/T)> {
-        next(&self.root, key, 0)
-    }
-
-    pure fn contains(&self, key: uint) -> bool {
-        let mut node = &self.root;
-        let mut idx = 0;
-        loop {
-            match node.children[chunk(key, idx)] {
-              Internal(ref x) => node = &**x,
-              External(stored,_) => return stored == key,
-              Nothing => return false
-            }
-            idx += 1;
-        }
-    }
-
-    fn each_mut(&mut self, f: fn(uint,&mut T) -> bool) {
-        self.root.each_mut(f)
-    }
-
-    fn insert(&mut self, key: uint, val: T) -> bool {
-        let ret = insert(&mut self.root.count,
-                         &mut self.root.children[chunk(key, 0)],
-                         key, val, 1);
-        if ret { self.length += 1 }
-        ret
-    }
-
-    fn remove(&mut self, key: uint) -> bool {
-        let ret = remove(&mut self.root.count,
-                         &mut self.root.children[chunk(key, 0)], key, 1);
-        if ret { self.length -= 1 }
-        ret
-    }
-
-}
-
-struct TrieNode<T> {
-    priv count: uint,
-    priv children: [Child<T> * 16] // FIXME: can't use the SIZE constant yet
-}
-
-impl<T:Copy> TrieNode<T> {
-    static pure fn new() -> TrieNode<T> {
-        TrieNode{count: 0, children: [Nothing, ..SIZE]}
-    }
-
-    fn each_mut(&mut self, f: fn(uint, &mut T) -> bool) {
-        for vec::each_mut(self.children) |child| {
-            match *child {
-                Internal(ref mut x) => {
-                    // Sigh, not-very-composable for loops.
-                    let mut stop = false;
-                    for x.each_mut |k,v| {
-                        if !f(k,v) {
-                            stop = true;
-                            break;
-                        }
-                    }
-                    if stop {
-                        break;
-                    }
-                }
-                External(k, ref mut v) => {
-                    if !f(k, v) {
-                        break;
-                    }
-                }
-                Nothing => ()
-            }
-        }
-    }
-
-}
-
-#[inline(always)]
-pure fn chunk(n: uint, idx: uint) -> uint {
-    use core::sys;
-    (n >> ((size_of::<uint>() * 8) - (SHIFT * (idx + 1)))) & MASK
-}
-
-pure fn prev<T>(node: &k/TrieNode<T>,
-                mut key: uint,
-                idx: uint) -> Option<(uint,&k/T)> {
-    let mut c = chunk(key, idx) as int;
-    while c >= 0 {
-        match node.children[c] {
-            Internal(ref sub) => {
-                match prev(*sub, key, idx+1) {
-                    None => (),
-                    Some(v) => return Some(v)
-                }
-            }
-            External(k,ref v) if k <= key => return Some((k,v)),
-            External(_,_) | Nothing => ()
-        }
-        // If we find nothing in the c child, we move to the next-lowest
-        // child in the array and ask for its _maximum_ value, since that's
-        // necessarily the next-lowest all the way down.
-        c -= 1;
-        key = uint::max_value;
-    }
-    None
-}
-
-pure fn next<T>(node: &k/TrieNode<T>,
-                mut key: uint,
-                idx: uint) -> Option<(uint,&k/T)> {
-    let mut c = chunk(key, idx) as int;
-    while c < (SIZE as int) {
-        match node.children[c] {
-            Internal(ref sub) => {
-                match next(*sub, key, idx+1) {
-                    None => (),
-                    Some(v) => return Some(v)
-                }
-            }
-            External(k,ref v) if k >= key => return Some((k,v)),
-            External(_,_) | Nothing => ()
-        }
-        // If we find nothing in the c child, we move to the next-highest
-        // child in the array and ask for its _minimum_ value, since that's
-        // necessarily the next-highest all the way down.
-        c += 1;
-        key = 0;
-    }
-    None
-}
-
-
-fn insert<T:Copy>(count: &mut uint,
-                  child: &mut Child<T>,
-                  key: uint,
-                  val: T,
-                  idx: uint) -> bool {
-    let mut tmp = Nothing;
-    tmp <-> *child;
-    let mut added = false;
-    *child = match tmp {
-        External(ekey, eval) => {
-            if ekey == key {
-                External(ekey, val)
-            } else {
-                added = true;
-                // conflict - split the node
-                let mut new = ~TrieNode::new();
-                insert(&mut new.count,
-                       &mut new.children[chunk(ekey, idx)],
-                       ekey, eval, idx + 1);
-                insert(&mut new.count,
-                       &mut new.children[chunk(key, idx)],
-                       key, val, idx + 1);
-                Internal(new)
-            }
-        }
-        Internal(x) => {
-            let mut x = x;
-            added = insert(&mut x.count,
-                           &mut x.children[chunk(key, idx)],
-                           key, val, idx + 1);
-            Internal(x)
-        }
-        Nothing => {
-            *count += 1;
-            added = true;
-            External(key, val)
-        }
-    };
-    added
-}
-
-fn remove<T>(count: &mut uint,
-             child: &mut Child<T>,
-             key: uint,
-             idx: uint) -> bool {
-    let (ret, this) = match *child {
-        External(stored, _) => {
-            if stored == key { (true, true) } else { (false, false) }
-        }
-        Internal(ref mut x) => {
-            let ret = remove(&mut x.count, &mut x.children[chunk(key, idx)],
-                             key, idx + 1);
-            (ret, x.count == 0)
-        }
-        Nothing => (false, false)
-    };
-
-    if this {
-        *child = Nothing;
-        *count -= 1;
-    }
-    ret
-}
+use container::{Container, Mutable, Map};
+use trie;
+use rt::swap_registers;
 
 #[cfg(notest)] use ptr::to_unsafe_ptr;
 
@@ -403,8 +168,8 @@ pub struct Gc {
     report_gc_stats: bool,
 
     gc_in_progress: bool,
-    free_buffer: TrieMap<()>,
-    heap: TrieMap<HeapRecord>,
+    free_buffer: trie::TrieMap<()>,
+    heap: trie::TrieMap<HeapRecord>,
     lowest: uint,
     highest: uint,
 
@@ -428,7 +193,7 @@ fn debug_mem() -> bool {
 }
 
 pub impl Gc {
-    static fn get_task_gc() -> &mut Gc {
+    fn get_task_gc() -> &mut Gc {
         unsafe {
             let tp : *Task = transmute(rust_get_task());
             let task : &mut Task = transmute(tp);
@@ -442,7 +207,7 @@ pub impl Gc {
 
 
     #[cfg(unix)]
-    static fn debug_gc() -> bool {
+    fn debug_gc() -> bool {
         use os;
         use libc;
         do os::as_c_charp("RUST_DEBUG_GC") |p| {
@@ -451,7 +216,7 @@ pub impl Gc {
     }
 
     #[cfg(unix)]
-    static fn report_gc_stats() -> bool {
+    fn report_gc_stats() -> bool {
         use os;
         use libc;
         do os::as_c_charp("RUST_REPORT_GC_STATS") |p| {
@@ -460,7 +225,7 @@ pub impl Gc {
     }
 
     #[cfg(unix)]
-    static fn actually_gc() -> bool {
+    fn actually_gc() -> bool {
         use os;
         use libc;
         do os::as_c_charp("RUST_ACTUALLY_GC") |p| {
@@ -469,21 +234,21 @@ pub impl Gc {
     }
 
     #[cfg(windows)]
-    static fn debug_gc() -> bool {
+    fn debug_gc() -> bool {
         false
     }
 
     #[cfg(windows)]
-    static fn report_gc_stats() -> bool {
+    fn report_gc_stats() -> bool {
         false
     }
     
     #[cfg(windows)]
-    static fn actually_gc() -> bool {
+    fn actually_gc() -> bool {
         false
     }
 
-    static fn new(t: *Task) -> Gc {
+    fn new(t: *Task) -> Gc {
         Gc {
             task: t,
             debug_gc: Gc::debug_gc(),
@@ -491,8 +256,8 @@ pub impl Gc {
             report_gc_stats: Gc::report_gc_stats(),
 
             gc_in_progress: false,
-            free_buffer: TrieMap::new(),
-            heap: TrieMap::new(),
+            free_buffer: trie::TrieMap::new(),
+            heap: trie::TrieMap::new(),
             lowest: 0,
             highest: 0,
 
@@ -512,7 +277,7 @@ pub impl Gc {
     }
 
     #[inline(always)]
-    static fn stderr_fd() -> fd_t {
+    fn stderr_fd() -> fd_t {
         libc::STDERR_FILENO as fd_t
     }
 
@@ -553,7 +318,7 @@ pub impl Gc {
         }
     }
 
-    static fn write_str_uint(s: &str, n: uint) {
+    fn write_str_uint(s: &str, n: uint) {
         let e = Gc::stderr_fd();
         e.write_str(s);
         e.write_str(": ");
@@ -561,7 +326,7 @@ pub impl Gc {
         e.write_str("\n");
     }
 
-    static fn write_str_hex(s: &str, n: uint) {
+    fn write_str_hex(s: &str, n: uint) {
         let e = Gc::stderr_fd();
         e.write_str(s);
         e.write_str(": ");
@@ -569,7 +334,7 @@ pub impl Gc {
         e.write_str("\n");
     }
 
-    static fn report_stat(s: &str, t: &mut Stat) {
+    fn report_stat(s: &str, t: &mut Stat) {
         let e = Gc::stderr_fd();
         e.write_str("    ");
         e.write_str(s);
@@ -621,7 +386,7 @@ pub impl Gc {
     }
 
     fn note_alloc(&mut self, ptr: uint, sz: uint, align: uint) {
-        assert !self.gc_in_progress;
+        assert!(!self.gc_in_progress);
         let h = HeapRecord {
             size: exchange_alloc::get_box_size(sz, align),
             is_marked: false
@@ -631,20 +396,20 @@ pub impl Gc {
         if ! self.actually_gc {
             return;
         }
-        if self.heap.length > self.threshold {
+        if self.heap.len() > self.threshold {
             self.debug_str("commencing gc at threshold: ");
             self.debug_uint(self.threshold);
             self.debug_str("\n");
-            let prev = self.heap.length;
+            let prev = self.heap.len();
             unsafe {
                 self.gc();
             }
             self.debug_str("gc complete, heap count: ");
-            self.debug_uint(self.heap.length);
+            self.debug_uint(self.heap.len());
             self.debug_str(" (freed ");
-            self.debug_uint(prev - self.heap.length);
+            self.debug_uint(prev - self.heap.len());
             self.debug_str(" boxes)\n");
-            if self.heap.length * 2 > self.threshold {
+            if self.heap.len() * 2 > self.threshold {
                 self.debug_str("gc did not recover enough, \
                                 raising threshold to: ");
                 self.debug_uint(self.threshold * 2);
@@ -659,11 +424,11 @@ pub impl Gc {
         if self.gc_in_progress {
             self.free_buffer.insert(ptr, ());
         } else {
-            self.heap.remove(ptr);
+            self.heap.remove(&ptr);
             if ! self.actually_gc {
                 return;
             }
-            if self.heap.length < (self.threshold / 4) {
+            if self.heap.len() < (self.threshold / 4) {
                 self.debug_str("lowering gc threshold to: ");
                 self.debug_uint(self.threshold / 2);
                 self.debug_str("\n");
@@ -673,7 +438,7 @@ pub impl Gc {
     }
 
     fn note_realloc(&mut self, from: uint, to: uint, sz: uint) {
-        assert !self.gc_in_progress;
+        assert!(!self.gc_in_progress);
         if self.debug_gc {
             let e = Gc::stderr_fd();
             e.write_str("gc::note_realloc: ");
@@ -684,7 +449,7 @@ pub impl Gc {
             e.write_hex_uint(to + sz);
             e.write_str(")\n");
         }
-        self.heap.remove(from);
+        self.heap.remove(&from);
         let h = HeapRecord {
             size: sz,
             is_marked: false
@@ -693,10 +458,10 @@ pub impl Gc {
     }
 
     fn check_consistency(&mut self, phase: &str) {
-        let mut tmp = TrieMap::new();
+        let mut tmp = trie::TrieMap::new();
         for self.each_live_alloc |box| {
             let box = box as uint;
-            if ! self.heap.contains(box) {
+            if ! self.heap.contains_key(&box) {
                 Gc::stderr_fd().write_str(phase);
                 Gc::write_str_hex(" inconsistency: gc heap \
                                    missing live alloc ptr",
@@ -704,26 +469,25 @@ pub impl Gc {
             }
             tmp.insert(box, ());
         }
-        for self.heap.each_mut |box, _| {
-            if ! tmp.contains(box) {
+        for self.heap.each_key |box| {
+            if ! tmp.contains_key(box) {
                 Gc::stderr_fd().write_str(phase);
                 Gc::write_str_hex(" inconsistency: live allocs \
                                    missing gc heap ptr",
-                                  box)
+                                  *box)
             }
         }
-        if self.heap.length != tmp.length {
+        if self.heap.len() != tmp.len() {
             Gc::stderr_fd().write_str(phase);
             Gc::write_str_uint(" inconsistency: num gc heap ptr",
-                               self.heap.length);
+                               self.heap.len());
             Gc::stderr_fd().write_str(phase);
             Gc::write_str_uint(" inconsistency: num live alloc ptrs",
-                               tmp.length);
+                               tmp.len());
         }
     }
 
     unsafe fn each_live_alloc(&self, f: &fn(box: *mut BoxRepr) -> bool) {
-        use managed;
         let box = (*self.task).boxed_region.live_allocs;
         let mut box: *mut BoxRepr = transmute(copy box);
         while box != mut_null() {
@@ -735,15 +499,15 @@ pub impl Gc {
         }
     }
                   
-    static unsafe fn drop_boxes(actually_drop: bool,
+    unsafe fn drop_boxes(actually_drop: bool,
                                 debug_flag: bool,
                                 boxes_dropped: &mut Stat,
                                 bytes_dropped: &mut Stat,
-                                free_buffer: &mut TrieMap<()>,
-                                each: fn(fn(*mut BoxRepr, uint) -> bool)) {
+                                free_buffer: &mut trie::TrieMap<()>,
+                                each: &fn(&fn(*mut BoxRepr, uint) -> bool)) {
         
         for each |boxp, _size| {
-            if free_buffer.contains(boxp as uint) {
+            if free_buffer.contains_key(&(boxp as uint)) {
                 loop;
             }
             let box: &mut BoxRepr = transmute(boxp);
@@ -760,7 +524,7 @@ pub impl Gc {
         }
 
         for each |boxp, _size| {
-            if free_buffer.contains(boxp as uint) {
+            if free_buffer.contains_key(&(boxp as uint)) {
                 loop;
             }
             let box: &BoxRepr = transmute(boxp);
@@ -780,7 +544,7 @@ pub impl Gc {
         }
 
         for each |boxp, size| {
-            if free_buffer.contains(boxp as uint) {
+            if free_buffer.contains_key(&(boxp as uint)) {
                 loop;
             }
             let box: &BoxRepr = transmute(boxp);
@@ -926,7 +690,7 @@ pub impl Gc {
                           &mut self.n_boxes_swept,
                           &mut self.n_bytes_swept,
                           &mut self.free_buffer) |step| {
-            for self.heap.each_mut |ptr, record| {
+            for self.heap.mutate_values |ptr, record| {
                 if record.is_marked {
                     loop;
                 }
@@ -935,12 +699,12 @@ pub impl Gc {
         }
 
         // Clear all mark bits
-        for self.heap.each_mut |_, record| {
+        for self.heap.mutate_values |_, record| {
             record.is_marked = false;
         }
 
         // Clean out the free buffer
-        for self.free_buffer.each_mut |ptr, _| {
+        for self.free_buffer.each_key |ptr| {
             self.heap.remove(ptr);
             ()
         }
@@ -999,11 +763,11 @@ pub impl Gc {
                           &mut self.n_boxes_annihilated,
                           &mut self.n_bytes_annihilated,
                           &mut self.free_buffer) |step| {
-            for self.heap.each_mut |ptr, record| {
+            for self.heap.mutate_values |ptr, record| {
                 step(transmute(ptr), record.size);
             }
         }
-        for self.free_buffer.each_mut |ptr, _| {
+        for self.free_buffer.each_key |ptr| {
             self.heap.remove(ptr);
             ()
         }
@@ -1017,7 +781,7 @@ pub impl Gc {
 pub struct Stat {
     curr: i64,
     total: i64,
-    hist: [i64 * 64],
+    hist: [i64, ..64],
 }
 
 pub impl Stat {
@@ -1028,7 +792,7 @@ pub impl Stat {
         }
         self.curr = 0;
     }
-    static fn new() -> Stat {
+    fn new() -> Stat {
         Stat {
             curr: 0,
             total: 0,
@@ -1071,8 +835,5 @@ extern {
 
     #[rust_stack]
     fn rust_upcall_free(ptr: *c_char);
-
-    #[rust_stack]
-    fn swap_registers(out_regs: *mut Registers, in_regs: *Registers);
 }
 
