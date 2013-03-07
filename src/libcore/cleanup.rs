@@ -13,12 +13,12 @@
 
 use cast::transmute;
 use io::{fd_t, WriterUtil};
-use libc::{c_char, c_void, c_uint, intptr_t, uintptr_t, size_t};
+use libc::{c_char, c_void, c_uint, intptr_t, uintptr_t};
 use libc;
 use managed::raw::{BoxRepr, BoxHeaderRepr,
                    RC_MANAGED_UNIQUE, RC_IMMORTAL};
-use option::{Option,Some,None};
-use ptr::{mut_null, null, to_unsafe_ptr, offset};
+use option::{Some,None};
+use ptr::{mut_null, null, to_unsafe_ptr};
 use sys::size_of;
 use sys::{TypeDesc, size_of};
 use task::each_retained_ptr;
@@ -196,7 +196,7 @@ fn debug_mem() -> bool {
     ::rt::env::get().debug_mem
 }
 
-#[deriving_eq]
+#[deriving(Eq)]
 enum GcPhase {
     GcIdle,
     GcMarkingStack,
@@ -838,8 +838,8 @@ pub struct Stat {
     hist: [i64, ..64],
 }
 
-const hist_bars : [char * 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
-const empty : char = '⋯';
+static hist_bars : [char, ..8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
+static empty : char = '⋯';
 
 pub impl Stat {
     fn flush(&mut self) {
