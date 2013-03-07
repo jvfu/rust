@@ -205,6 +205,48 @@ enum GcPhase {
     GcAnnihilating
 }
 
+mod gc_flags {
+    use ptr::null;
+
+    #[cfg(unix)]
+    pub fn debug_gc() -> bool {
+        use os;
+        use libc;
+        do os::as_c_charp("RUST_DEBUG_GC") |p| {
+            unsafe { libc::getenv(p) != null() }
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn report_gc_stats() -> bool {
+        use os;
+        use libc;
+        do os::as_c_charp("RUST_REPORT_GC_STATS") |p| {
+            unsafe { libc::getenv(p) != null() }
+        }
+    }
+
+    pub fn actually_gc() -> bool {
+        true
+    }
+
+    #[cfg(windows)]
+    pub fn debug_gc() -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    pub fn actually_gc() -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    pub fn report_gc_stats() -> bool {
+        false
+    }
+
+}
+
 pub impl Gc {
     fn get_task_gc() -> &mut Gc {
         unsafe {
@@ -218,55 +260,12 @@ pub impl Gc {
         }
     }
 
-
-    #[cfg(unix)]
-    fn debug_gc() -> bool {
-        use os;
-        use libc;
-        do os::as_c_charp("RUST_DEBUG_GC") |p| {
-            unsafe { libc::getenv(p) != null() }
-        }
-    }
-
-    #[cfg(unix)]
-    fn report_gc_stats() -> bool {
-        use os;
-        use libc;
-        do os::as_c_charp("RUST_REPORT_GC_STATS") |p| {
-            unsafe { libc::getenv(p) != null() }
-        }
-    }
-
-    #[cfg(unix)]
-    fn actually_gc() -> bool {
-        use os;
-        use libc;
-        do os::as_c_charp("RUST_ACTUALLY_GC") |p| {
-            unsafe { libc::getenv(p) != null() }
-        }
-    }
-
-    #[cfg(windows)]
-    fn debug_gc() -> bool {
-        false
-    }
-
-    #[cfg(windows)]
-    fn report_gc_stats() -> bool {
-        false
-    }
-
-    #[cfg(windows)]
-    fn actually_gc() -> bool {
-        false
-    }
-
     fn new(t: *Task) -> Gc {
         Gc {
             task: t,
-            debug_gc: Gc::debug_gc(),
-            actually_gc: Gc::actually_gc(),
-            report_gc_stats: Gc::report_gc_stats(),
+            debug_gc: self::gc_flags::debug_gc(),
+            actually_gc: self::gc_flags::actually_gc(),
+            report_gc_stats: self::gc_flags::report_gc_stats(),
 
             phase: GcIdle,
             free_buffer: trie::TrieMap::new(),
@@ -436,10 +435,11 @@ pub impl Gc {
         // (which we raise if nothing is freed). We _also_ GC every N
         // allocs of "churn", even if the heap has not expanded, on the
         // premise that churn might cause existing retained memory to
-        // become garbage. N is set to 25%-of-the-heap-count.
+        // become garbage. N is set to max(100000, 25%-of-the-heap-count).
 
         if self.heap.len() > self.threshold ||
-            self.alloc_count * 4 > self.heap.len() {
+            (self.alloc_count > 100000 &&
+             self.alloc_count * 4 > self.heap.len()) {
             self.debug_str("commencing gc at threshold: ");
             self.debug_uint(self.threshold);
             self.debug_str("\n");
@@ -612,22 +612,22 @@ pub impl Gc {
                           addr: uint) {
 
         if addr < self.lowest || addr > self.highest {
-            self.debug_str_hex("implausible heap addr", addr);
+            // self.debug_str_hex("implausible heap addr", addr);
             return;
         }
 
-        self.debug_str_hex("searching for prev object", addr);
+        // self.debug_str_hex("searching for prev object", addr);
         let (obj, record) = match self.heap.prev(addr) {
             None => {
-                self.debug_str_hex("no object found", addr);
+                // self.debug_str_hex("no object found", addr);
                 return
             }
             Some((obj,rptr)) => (obj, *rptr)
         };
 
         if addr > obj + record.size {
-            self.debug_str_range("address past object-end",
-                                 obj, record.size);
+            //self.debug_str_range("address past object-end",
+            //                     obj, record.size);
             // We picked the object previous to the probe addr; but that
             // object might not extend all the way to _include_ the probe
             // addr. If not, skip.
@@ -635,7 +635,7 @@ pub impl Gc {
         }
 
         if record.is_marked {
-            self.debug_str_hex("object already marked", obj);
+            //self.debug_str_hex("object already marked", obj);
             // if we've already visited, don't visit again.
             return;
         }

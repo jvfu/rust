@@ -566,9 +566,11 @@ pub fn make_drop_glue(bcx: block, v0: ValueRef, t: ty::t) {
 }
 
 pub fn decr_refcnt_maybe_free(bcx: block,
-                              box_ptr: ValueRef,
-                              t: ty::t)
+                              _box_ptr: ValueRef,
+                              _t: ty::t)
                            -> block {
+    bcx
+/*
     let _icx = bcx.insn_ctxt("decr_refcnt_maybe_free");
     let ccx = bcx.ccx();
 
@@ -579,6 +581,7 @@ pub fn decr_refcnt_maybe_free(bcx: block,
         let zero_test = ICmp(bcx, lib::llvm::IntEQ, C_int(ccx, 0), rc);
         with_cond(bcx, zero_test, |bcx| free_ty_immediate(bcx, box_ptr, t))
     }
+*/
 }
 
 
@@ -632,13 +635,15 @@ pub fn make_take_glue(bcx: block, v: ValueRef, t: ty::t) {
     build_return(bcx);
 }
 
-pub fn incr_refcnt_of_boxed(cx: block, box_ptr: ValueRef) {
+pub fn incr_refcnt_of_boxed(_cx: block, _box_ptr: ValueRef) {
+    /*
     let _icx = cx.insn_ctxt("incr_refcnt_of_boxed");
     let ccx = cx.ccx();
     let rc_ptr = GEPi(cx, box_ptr, [0u, abi::box_field_refcnt]);
     let rc = Load(cx, rc_ptr);
     let rc = Add(cx, rc, C_int(ccx, 1));
     Store(cx, rc, rc_ptr);
+    */
 }
 
 // Generates the declaration for (but doesn't emit) a type descriptor.
