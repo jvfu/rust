@@ -24,6 +24,7 @@ use sys::{TypeDesc, size_of};
 use task::each_retained_ptr;
 use uint;
 use vec;
+use i64;
 use unstable::exchange_alloc;
 use unstable::intrinsics::ctlz64;
 use container::{Container, Mutable, Map};
@@ -167,20 +168,23 @@ pub struct Gc {
     actually_gc: bool,
     report_gc_stats: bool,
 
-    gc_in_progress: bool,
+    phase: GcPhase,
     free_buffer: trie::TrieMap<()>,
     heap: trie::TrieMap<HeapRecord>,
     lowest: uint,
     highest: uint,
 
     threshold: uint,
+    alloc_count: uint,
 
     n_collections: uint,
     n_ns_marking: Stat,
     n_ns_sweeping: Stat,
     n_ns_total: Stat,
-    n_boxes_marked: Stat,
-    n_bytes_marked: Stat,
+    n_boxes_marked_from_stack: Stat,
+    n_bytes_marked_from_stack: Stat,
+    n_boxes_marked_from_tls: Stat,
+    n_bytes_marked_from_tls: Stat,
     n_boxes_swept: Stat,
     n_bytes_swept: Stat,
     n_boxes_annihilated: Stat,
@@ -190,6 +194,15 @@ pub struct Gc {
 #[cfg(unix)]
 fn debug_mem() -> bool {
     ::rt::env::get().debug_mem
+}
+
+#[deriving_eq]
+enum GcPhase {
+    GcIdle,
+    GcMarkingStack,
+    GcMarkingTls,
+    GcSweeping,
+    GcAnnihilating
 }
 
 pub impl Gc {
@@ -242,7 +255,7 @@ pub impl Gc {
     fn report_gc_stats() -> bool {
         false
     }
-    
+
     #[cfg(windows)]
     fn actually_gc() -> bool {
         false
@@ -255,20 +268,23 @@ pub impl Gc {
             actually_gc: Gc::actually_gc(),
             report_gc_stats: Gc::report_gc_stats(),
 
-            gc_in_progress: false,
+            phase: GcIdle,
             free_buffer: trie::TrieMap::new(),
             heap: trie::TrieMap::new(),
             lowest: 0,
             highest: 0,
 
             threshold: 1024,
+            alloc_count: 0,
 
             n_collections: 0,
             n_ns_marking: Stat::new(),
             n_ns_sweeping: Stat::new(),
             n_ns_total: Stat::new(),
-            n_boxes_marked: Stat::new(),
-            n_bytes_marked: Stat::new(),
+            n_boxes_marked_from_stack: Stat::new(),
+            n_bytes_marked_from_stack: Stat::new(),
+            n_boxes_marked_from_tls: Stat::new(),
+            n_bytes_marked_from_tls: Stat::new(),
             n_boxes_swept: Stat::new(),
             n_bytes_swept: Stat::new(),
             n_boxes_annihilated: Stat::new(),
@@ -334,28 +350,29 @@ pub impl Gc {
         e.write_str("\n");
     }
 
-    fn report_stat(s: &str, t: &mut Stat) {
+    fn flush_and_report_stat(do_report: bool,
+                             s: &str,
+                             t: &mut Stat) {
         let e = Gc::stderr_fd();
-        e.write_str("    ");
-        e.write_str(s);
-        e.write_str(": ");
-        e.write_uint(t.curr as uint);
-        t.flush();
-        e.write_str(" curr, ");
-        e.write_uint(t.total as uint);
-        e.write_str(" total (hist:");
-        for vec::eachi(t.hist) |i, elt| {
-            if *elt != 0 {
-                e.write_str(" ");
-                e.write_uint(i);
-                e.write_str(":");
-                e.write_uint(*elt as uint);
-            }
+        if do_report {
+            e.write_str("    ");
+            e.write_str(s);
+            e.write_str(": ");
+            e.write_uint(t.curr as uint);
         }
-        e.write_str(")\n");
+        t.flush();
+        if do_report {
+            e.write_str(" curr, ");
+            e.write_uint(t.total as uint);
+            e.write_str(" total\n");
+            e.write_str("        ");
+            e.write_str("hist: ");
+            t.draw_hist(e);
+            e.write_str("\n");
+        }
     }
 
-    fn report_stats(&mut self, phase: &str) {
+    fn flush_and_report_stats(&mut self, phase: &str) {
         if self.report_gc_stats {
             let e = Gc::stderr_fd();
             e.write_str("\n--- ");
@@ -363,30 +380,47 @@ pub impl Gc {
             e.write_str(" stats ---\n");
             Gc::write_str_uint("    n_collections",
                                self.n_collections);
-            Gc::report_stat("n_ns_marking",
-                            &mut self.n_ns_marking);
-            Gc::report_stat("n_ns_sweeping",
-                            &mut self.n_ns_sweeping);
-            Gc::report_stat("n_ns_total",
-                            &mut self.n_ns_total);
-
-            Gc::report_stat("n_boxes_marked",
-                            &mut self.n_boxes_marked);
-            Gc::report_stat("n_bytes_marked",
-                            &mut self.n_bytes_marked);
-            Gc::report_stat("n_boxes_swept",
-                            &mut self.n_boxes_swept);
-            Gc::report_stat("n_bytes_swept",
-                            &mut self.n_bytes_swept);
-            Gc::report_stat("n_boxes_annihilated",
-                            &mut self.n_boxes_annihilated);
-            Gc::report_stat("n_bytes_annihilated",
-                            &mut self.n_bytes_annihilated);
         }
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                                  "n_ns_marking",
+                                  &mut self.n_ns_marking);
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_ns_sweeping",
+                        &mut self.n_ns_sweeping);
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_ns_total",
+                        &mut self.n_ns_total);
+
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_boxes_marked_from_stack",
+                        &mut self.n_boxes_marked_from_stack);
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_bytes_marked_from_stack",
+                        &mut self.n_bytes_marked_from_stack);
+
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_boxes_marked_from_tls",
+                        &mut self.n_boxes_marked_from_tls);
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_bytes_marked_from_tls",
+                        &mut self.n_bytes_marked_from_tls);
+
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_boxes_swept",
+                        &mut self.n_boxes_swept);
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_bytes_swept",
+                        &mut self.n_bytes_swept);
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_boxes_annihilated",
+                        &mut self.n_boxes_annihilated);
+        Gc::flush_and_report_stat(self.report_gc_stats,
+                        "n_bytes_annihilated",
+                        &mut self.n_bytes_annihilated);
     }
 
     fn note_alloc(&mut self, ptr: uint, sz: uint, align: uint) {
-        assert!(!self.gc_in_progress);
+        assert!(self.phase == GcIdle);
         let h = HeapRecord {
             size: exchange_alloc::get_box_size(sz, align),
             is_marked: false
@@ -396,10 +430,20 @@ pub impl Gc {
         if ! self.actually_gc {
             return;
         }
-        if self.heap.len() > self.threshold {
+        self.alloc_count += 1;
+
+        // We allocate when the number of heap objects exceeds a threshold
+        // (which we raise if nothing is freed). We _also_ GC every N
+        // allocs of "churn", even if the heap has not expanded, on the
+        // premise that churn might cause existing retained memory to
+        // become garbage. N is set to 25%-of-the-heap-count.
+
+        if self.heap.len() > self.threshold ||
+            self.alloc_count * 4 > self.heap.len() {
             self.debug_str("commencing gc at threshold: ");
             self.debug_uint(self.threshold);
             self.debug_str("\n");
+            self.alloc_count = 0;
             let prev = self.heap.len();
             unsafe {
                 self.gc();
@@ -421,7 +465,7 @@ pub impl Gc {
 
     fn note_free(&mut self, ptr: uint) {
         self.debug_str_hex("gc::note_free", ptr);
-        if self.gc_in_progress {
+        if self.phase != GcIdle {
             self.free_buffer.insert(ptr, ());
         } else {
             self.heap.remove(&ptr);
@@ -438,7 +482,7 @@ pub impl Gc {
     }
 
     fn note_realloc(&mut self, from: uint, to: uint, sz: uint) {
-        assert!(!self.gc_in_progress);
+        assert!(self.phase == GcIdle);
         if self.debug_gc {
             let e = Gc::stderr_fd();
             e.write_str("gc::note_realloc: ");
@@ -498,14 +542,13 @@ pub impl Gc {
             box = next
         }
     }
-                  
     unsafe fn drop_boxes(actually_drop: bool,
                                 debug_flag: bool,
                                 boxes_dropped: &mut Stat,
                                 bytes_dropped: &mut Stat,
                                 free_buffer: &mut trie::TrieMap<()>,
                                 each: &fn(&fn(*mut BoxRepr, uint) -> bool)) {
-        
+
         for each |boxp, _size| {
             if free_buffer.contains_key(&(boxp as uint)) {
                 loop;
@@ -601,15 +644,23 @@ pub impl Gc {
             ..record
         };
         self.heap.insert(obj, record);
-
-        self.n_boxes_marked.curr += 1;
-        self.n_bytes_marked.curr += record.size as i64;
+        self.count_marking(record.size);
 
         let adj = size_of::<BoxHeaderRepr>();
         self.mark_range("marking object", level + 1,
                         obj + adj, record.size - adj);
     }
-                         
+
+    fn count_marking(&mut self, size: uint) {
+        if self.phase == GcMarkingStack {
+            self.n_boxes_marked_from_stack.curr += 1;
+            self.n_bytes_marked_from_stack.curr += size as i64;
+        } else {
+            self.n_boxes_marked_from_tls.curr += 1;
+            self.n_bytes_marked_from_tls.curr += size as i64;
+        }
+    }
+
     unsafe fn mark_stack(&mut self) {
 
         // We want to avoid marking frames below us, so we
@@ -649,6 +700,7 @@ pub impl Gc {
 
     unsafe fn mark(&mut self) {
 
+        self.phase = GcMarkingStack;
         self.lowest = match self.heap.next(0) {
             None => 0,
             Some((k, _)) => k
@@ -660,16 +712,6 @@ pub impl Gc {
 
         self.debug_str_hex("lowest heap ptr", self.lowest);
         self.debug_str_hex("highest heap ptr", self.highest);
-        
-        self.mark_stack();
-
-        
-        self.debug_str("marking TLS values\n");
-        do each_retained_ptr(transmute(self.task)) |p| {
-            self.debug_str_hex("marking TLS value",
-                               transmute(p));
-            self.mark_object(0, transmute(p));
-        }
 
         // Awkward but necessary: registers must be 16-byte
         // aligned on x64 due to dumping xmm state using
@@ -682,9 +724,21 @@ pub impl Gc {
         for regs.each |r| {
             self.mark_object(0, transmute(*r));
         }
+
+        self.mark_stack();
+
+        self.phase = GcMarkingTls;
+        self.debug_str("marking TLS values\n");
+        do each_retained_ptr(transmute(self.task)) |p| {
+            self.debug_str_hex("marking TLS value",
+                               transmute(p));
+            self.mark_object(0, transmute(p));
+        }
+
     }
 
-    unsafe fn sweep(&mut self) {        
+    unsafe fn sweep(&mut self) {
+        self.phase = GcSweeping;
         do Gc::drop_boxes(self.actually_gc,
                           self.debug_gc,
                           &mut self.n_boxes_swept,
@@ -728,7 +782,6 @@ pub impl Gc {
         do each_retained_ptr(transmute(self.task)) |_| { }
 
         self.debug_str("gc starting\n");
-        self.gc_in_progress = true;
         self.check_consistency("pre-gc");
 
         precise_time_ns(&mut mark_start);
@@ -740,8 +793,9 @@ pub impl Gc {
         precise_time_ns(&mut sweep_end);
 
         self.check_consistency("post-gc");
-        self.gc_in_progress = false; 
         self.debug_str("gc finished\n");
+
+        self.phase = GcIdle;
 
         self.n_collections += 1;
         precise_time_ns(&mut end);
@@ -750,13 +804,13 @@ pub impl Gc {
         self.n_ns_sweeping.curr += (sweep_end - sweep_start) as i64;
         self.n_ns_total.curr += (end - start) as i64;
 
-        self.report_stats("gc");
+        self.flush_and_report_stats("gc");
     }
 
     unsafe fn annihilate(&mut self) {
         self.debug_str("annihilation starting\n");
         self.check_consistency("pre-annihilate");
-        self.gc_in_progress = true;
+        self.phase = GcAnnihilating;
 
         do Gc::drop_boxes(true,
                           self.debug_gc,
@@ -771,10 +825,10 @@ pub impl Gc {
             self.heap.remove(ptr);
             ()
         }
-        self.gc_in_progress = false;
+        self.phase = GcIdle;
         self.check_consistency("post-annihilate");
         self.debug_str("annihilation finished\n");
-        self.report_stats("annihilation");
+        self.flush_and_report_stats("annihilation");
     }
 }
 
@@ -784,6 +838,9 @@ pub struct Stat {
     hist: [i64, ..64],
 }
 
+const hist_bars : [char * 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
+const empty : char = '⋯';
+
 pub impl Stat {
     fn flush(&mut self) {
         self.total += self.curr;
@@ -792,6 +849,21 @@ pub impl Stat {
         }
         self.curr = 0;
     }
+
+    fn draw_hist<W:WriterUtil>(&self, w: W) {
+        w.write_char('[');
+        for vec::each(self.hist) |elt| {
+            if *elt == 0 {
+                w.write_char(empty);
+            } else {
+                let magnitude = 64 - unsafe { ctlz64(*elt) };
+                let magnitude = i64::min(magnitude, 8);
+                w.write_char(hist_bars[magnitude - 1]);
+            }
+        }
+        w.write_char(']');
+    }
+
     fn new() -> Stat {
         Stat {
             curr: 0,
