@@ -169,6 +169,11 @@ pub impl<T> TrieMap<T> {
     fn next(&self, key: uint) -> Option<(uint,&'self T)> {
         next(&self.root, key, 0)
     }
+
+    // Fires a callback on greatest k where k <= key, if any.
+    fn mutate_prev(&mut self, key: uint, f: &fn(uint, &mut T)) {
+        mutate_prev(&mut self.root, f, key, 0);
+    }
 }
 
 pub struct TrieSet {
@@ -337,6 +342,33 @@ fn prev<'k, T>(node: &'k TrieNode<T>,
         key = uint::max_value;
     }
     None
+}
+
+fn mutate_prev<T>(node: &mut TrieNode<T>,
+                  f: &fn(uint, &mut T),
+                  mut key: uint,
+                  idx: uint) -> bool {
+    let mut c = chunk(key, idx) as int;
+    while c >= 0 {
+        match node.children[c] {
+            Internal(ref mut sub) => {
+                if mutate_prev(*sub, f, key, idx+1) {
+                    return true;
+                }
+            }
+            External(k,ref mut v) if k <= key => {
+                f(k, v);
+                return true;
+            }
+            External(_,_) | Nothing => ()
+        }
+        // If we find nothing in the c child, we move to the next-lowest
+        // child in the array and ask for its _maximum_ value, since that's
+        // necessarily the next-lowest all the way down.
+        c -= 1;
+        key = uint::max_value;
+    }
+    return false;
 }
 
 fn next<'k, T>(node: &'k TrieNode<T>,

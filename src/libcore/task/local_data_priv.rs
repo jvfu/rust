@@ -87,6 +87,9 @@ pub unsafe fn each_retained_ptr(task: *rust_task,
     let p: **libc::c_void = cast::transmute(&map);
     cb(*p);
 
+    let pp: **libc::c_void = cast::transmute(&(map));
+    cb(*pp);
+
     for map.each |elt| {
         match elt {
             &None => (),
