@@ -465,7 +465,6 @@ pub impl Gc {
 
         self.n_mallocs.curr += 1;
         assert!(self.phase == GcIdle || self.phase == GcStarting);
-
         let h = HeapRecord {
             size: exchange_alloc::get_box_size(sz, align),
             is_marked: false
