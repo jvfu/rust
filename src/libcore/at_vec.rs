@@ -251,7 +251,6 @@ pub mod raw {
      * * n - The number of elements to reserve space for
      */
     pub unsafe fn reserve<T>(v: &mut @[T], n: uint) {
-        use sys::size_of;
         use cleanup::Gc;
         // Only make the (slow) call into the runtime if we have to
         if capacity(*v) < n {
@@ -263,7 +262,8 @@ pub mod raw {
             Gc::get_task_gc().note_realloc(pre as uint,
                                            post as uint,
                                            (*post).unboxed.alloc +
-                                           size_of::<VecRepr>());
+                                           48
+                                           /* size_of::<VecRepr>() */);
         }
     }
 

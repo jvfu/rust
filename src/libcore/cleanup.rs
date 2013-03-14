@@ -29,7 +29,6 @@ use unstable::intrinsics::ctlz64;
 
 use container::{Container, Mutable, Map};
 use trie::{TrieMap, TrieSet};
-use rt::swap_registers;
 
 #[cfg(notest)] use ptr::to_unsafe_ptr;
 
@@ -473,6 +472,7 @@ pub impl Gc {
         };
         self.debug_str_range("gc::note_malloc", ptr, h.size);
         assert!(self.heap.insert(ptr, h));
+
         if ! self.actually_gc {
             return;
         }
@@ -486,8 +486,8 @@ pub impl Gc {
 
         if (self.phase == GcIdle && self.gc_zeal) ||
             self.heap.len() > self.threshold ||
-            (self.alloc_count > 100000 &&
-             self.alloc_count * 4 > self.heap.len()) {
+            (self.alloc_count > 10000000 &&
+             self.alloc_count > self.heap.len()) {
             self.debug_str("commencing gc at threshold: ");
             self.debug_uint(self.threshold);
             self.debug_str("\n");
@@ -501,25 +501,27 @@ pub impl Gc {
             self.debug_str(" (freed ");
             self.debug_uint(prev - self.heap.len());
             self.debug_str(" boxes)\n");
-            if self.heap.len() * 2 > self.threshold {
+            if self.heap.len() * 4 > self.threshold {
                 self.debug_str("gc did not recover enough, \
                                 raising threshold to: ");
-                self.debug_uint(self.threshold * 2);
+                self.debug_uint(self.threshold * 4);
                 self.debug_str("\n");
-                self.threshold *= 2;
+                self.threshold *= 4;
             }
-
             unsafe {
                 if ! self.precious_freed.is_empty() {
                     let x = self.threshold;
                     self.threshold *= 100;
+                    self.actually_gc = false;
                     for self.precious_freed.each |p| {
                         Gc::write_str_hex("freed precious address", *p);
                         Gc::stderr_fd().write_str("\n---\n");
                         Gc::debug_opaque_box(*p);
                         Gc::stderr_fd().write_str("\n---\n");
                         self.precious.remove(p);
+                        fail!();
                     }
+                    self.actually_gc = true;
                     self.precious_freed.clear();
                     self.threshold = x;
                 }
@@ -535,7 +537,16 @@ pub impl Gc {
             assert!(self.free_buffer.insert(ptr));
         } else {
             assert!(self.heap.remove(&ptr));
-            self.precious.remove(&ptr);
+            unsafe {
+                if self.precious.contains(&ptr) {
+                    Gc::write_str_hex("explicitly freed precious address", ptr);
+                    Gc::stderr_fd().write_str("\n---\n");
+                    Gc::debug_opaque_box(ptr);
+                    Gc::stderr_fd().write_str("\n---\n");
+                    self.precious.remove(&ptr);
+                    fail!();
+                }
+            }
             if ! self.actually_gc {
                 return;
             }
@@ -544,11 +555,11 @@ pub impl Gc {
                     self.gc();
                 }
             }
-            if self.heap.len() < (self.threshold / 4) {
+            if self.heap.len() < (self.threshold / 8) {
                 self.debug_str("lowering gc threshold to: ");
-                self.debug_uint(self.threshold / 2);
+                self.debug_uint(self.threshold / 4);
                 self.debug_str("\n");
-                self.threshold /= 2;
+                self.threshold /= 4;
             }
         }
     }
@@ -728,50 +739,6 @@ pub impl Gc {
         }
     }
 
-    unsafe fn mark_object(&mut self,
-                          level: uint,
-                          addr: uint) {
-
-        if addr < self.lowest || addr > self.highest {
-            // self.debug_str_hex("implausible heap addr", addr);
-            return;
-        }
-
-        // self.debug_str_hex("searching for prev object", addr);
-        let (obj, record) = match self.heap.prev(addr) {
-            None => {
-                // self.debug_str_hex("no object found", addr);
-                return
-            }
-            Some((obj,rptr)) => (obj, *rptr)
-        };
-
-        if addr > obj + record.size {
-            //self.debug_str_range("address past object-end",
-            //                     obj, record.size);
-            // We picked the object previous to the probe addr; but that
-            // object might not extend all the way to _include_ the probe
-            // addr. If not, skip.
-            return;
-        }
-
-        if record.is_marked {
-            //self.debug_str_hex("object already marked", obj);
-            // if we've already visited, don't visit again.
-            return;
-        }
-        let record = HeapRecord {
-            is_marked: true,
-            ..record
-        };
-        assert!(self.heap.insert(obj, record));
-        self.count_marking(record.size);
-
-        let adj = 32; //size_of::<BoxHeaderRepr>();
-        self.mark_range("marking object", level + 1,
-                        obj + adj, record.size - adj);
-    }
-
     fn count_marking(&mut self, size: uint) {
         if self.phase == GcMarkingStack {
             self.n_boxes_marked_from_stack.curr += 1;
@@ -782,56 +749,24 @@ pub impl Gc {
         }
     }
 
-    unsafe fn mark_stack(&mut self) {
-
-        // We want to avoid marking frames below us, so we
-        // take a base address from the current frame and
-        // pass it into the stack-marker.
-        let base = 0;
-        let base : uint = transmute(&base);
-        let mut segment = (*self.task).stack_segment;
-        while segment != null() {
-            let mut ptr: uint = transmute(&(*segment).data);
-            let mut end: uint = transmute(copy (*segment).end);
-            if ptr <= base && base < end {
-                self.debug_str_hex("limiting stack-marking to base",
-                                   base);
-                ptr = base;
-            }
-            self.mark_range("marking stack segment",
-                            0, ptr, end-ptr);
-            segment = (*segment).prev;
-        }
-    }
-
-    unsafe fn mark_range(&mut self,
-                         s: &str, level: uint,
-                         p: uint, sz: uint) {
-        self.debug_str("level ");
-        self.debug_uint(level);
-        self.debug_str(": ");
-        self.debug_str_range(s, p, sz);
-        let mut curr = p;
-        let end = p + sz;
-        while curr + size_of::<uint>() <= end {
-            self.mark_object(level, *(curr as *uint));
-            curr += 1;
-        }
-    }
-
 
     #[inline(always)]
     unsafe fn mark_trie(addr: &mut uint,
                         sz: &mut uint,
+                        already_marked: &mut bool,
                         t: &mut TrieMap<HeapRecord>) -> bool {
         let mut hit = false;
         do t.mutate_prev(*addr) |obj, record| {
-            if *addr < obj + record.size &&
-                !record.is_marked {
+            if *addr < obj + record.size {
+                *already_marked = record.is_marked;
                 *addr = obj;
                 *sz = record.size;
-                record.is_marked = true;
-                hit = true
+                if !record.is_marked {
+                    *addr = obj;
+                    *sz = record.size;
+                    record.is_marked = true;
+                    hit = true
+                }
             }
         }
         return hit;
@@ -843,17 +778,28 @@ pub impl Gc {
             return;
         }
         let mut sz = 0;
+        let mut already_marked = false;
         if !Gc::mark_trie(&mut addr,
                           &mut sz,
+                          &mut already_marked,
                           &mut self.heap) {
+            if already_marked {
+                if self.phase == GcMarkingStack {
+                    self.debug_str_range("  already marked via stack",
+                                         addr, sz);
+                } else {
+                    self.debug_str_range("  already marked via TLS",
+                                         addr, sz);
+                }
+            }
             return;
         }
         if self.debug_gc {
             if self.phase == GcMarkingStack {
-                self.debug_str_range("marked via stack",
+                self.debug_str_range("  marked via stack",
                                      addr, sz);
             } else {
-                self.debug_str_range("marked via TLS",
+                self.debug_str_range("  marked via TLS",
                                      addr, sz);
             }
         }
@@ -872,11 +818,15 @@ pub impl Gc {
         while segment != null() {
             let mut ptr: uint = transmute(&(*segment).data);
             let mut end: uint = transmute(copy (*segment).end);
+
             if ptr <= base && base < end {
                 self.debug_str_hex("limiting stack-marking to base",
                                    base);
                 ptr = base;
             }
+
+            self.debug_str_range("queueing stack segment",
+                                 ptr, end-ptr);
             self.marking_stack.push((ptr, end-ptr));
             segment = (*segment).prev;
         }
@@ -944,60 +894,10 @@ pub impl Gc {
         }
         self.mark_queued();
 
-        // Awkward but necessary: registers must be 16-byte
-        // aligned on x64 due to dumping xmm state using
-        // movapd. So we don't use the Registers structure.
-        self.debug_str("marking registers and stack\n");
+        self.debug_str("marking stack\n");
         self.phase = GcMarkingStack;
-        let regs = [0u64, ..64];
-        let r : uint = transmute(&regs);
-        let r = (r + 16) & (!15);
-        swap_registers(transmute(r), transmute(r));
-        for regs.each |r| {
-            self.mark_one(transmute(*r))
-        }
-
         self.queue_stack();
         self.mark_queued();
-
-    }
-
-    unsafe fn mark(&mut self) {
-
-        self.phase = GcMarkingStack;
-        self.lowest = match self.heap.next(0) {
-            None => 0,
-            Some((k, _)) => k
-        };
-        self.highest = match self.heap.prev(uint::max_value) {
-            None => uint::max_value,
-            Some((k, r)) => k + r.size
-        };
-
-        self.debug_str_hex("lowest heap ptr", self.lowest);
-        self.debug_str_hex("highest heap ptr", self.highest);
-
-        // Awkward but necessary: registers must be 16-byte
-        // aligned on x64 due to dumping xmm state using
-        // movapd. So we don't use the Registers structure.
-        self.debug_str("marking registers\n");
-        let regs = [0u64, ..64];
-        let r : uint = transmute(&regs);
-        let r = (r + 16) & (!15);
-        swap_registers(transmute(r), transmute(r));
-        for regs.each |r| {
-            self.mark_object(0, transmute(*r));
-        }
-
-        self.mark_stack();
-
-        self.phase = GcMarkingTls;
-        self.debug_str("marking TLS values\n");
-        do each_retained_ptr(transmute(self.task)) |p| {
-            self.debug_str_hex("marking TLS value",
-                               transmute(p));
-            self.mark_object(0, transmute(p));
-        }
 
     }
 
@@ -1046,11 +946,17 @@ pub impl Gc {
     unsafe fn set_precious(&mut self, addr: uint) {
         if self.debug_gc {
             self.debug_gc = false;
+            self.report_gc_stats = false;
+            self.actually_gc = false;
+
             Gc::write_str_hex("registered precious pointer",
                               addr);
             Gc::stderr_fd().write_str("\n---\n");
             Gc::debug_opaque_box(addr);
             Gc::stderr_fd().write_str("\n---\n");
+
+            self.report_gc_stats = true;
+            self.actually_gc = true;
             self.debug_gc = true;
         }
         self.precious.insert(addr);
@@ -1191,10 +1097,48 @@ pub unsafe fn annihilate() {
     let _dropme: ~Gc = transmute(task.gc);
 }
 
-/// Releases all unreachable managed memory in the current task.
-pub fn gc() {
+fn gc_phase_2() {
     unsafe {
         Gc::get_task_gc().gc();
+    }
+}
+
+
+/// Releases all unreachable managed memory in the current task.
+#[cfg(stage0)]
+pub fn gc() {
+
+    unsafe {
+        // Awkward but necessary: registers must be 16-byte
+        // aligned on x64 due to dumping xmm state using
+        // movapd. So we don't use the Registers structure.
+        let regs = [0u64, ..80];
+        let r : uint = transmute(&regs);
+        let r = (r + 16) & (!15);
+
+        // Dump registers to stack and jump to gc_phase_2
+        let f : *c_void = transmute(gc_phase_2);
+        dump_registers(transmute(r), f);
+    }
+}
+
+/// Releases all unreachable managed memory in the current task.
+#[cfg(stage1)]
+#[cfg(stage2)]
+#[cfg(stage3)]
+pub fn gc() {
+
+    unsafe {
+        // Awkward but necessary: registers must be 16-byte
+        // aligned on x64 due to dumping xmm state using
+        // movapd. So we don't use the Registers structure.
+        let regs = [0u64, ..80];
+        let r : uint = transmute(&regs);
+        let r = (r + 16) & (!15);
+
+        // Dump registers to stack and jump to gc_phase_2
+        let f : *c_void = transmute(gc_phase_2);
+        dump_registers(transmute(r), f);
     }
 }
 
@@ -1220,5 +1164,8 @@ extern {
 
     #[rust_stack]
     fn rust_upcall_free(ptr: *c_char);
+
+    #[rust_stack]
+    fn dump_registers(out_regs: *mut Registers, next_fn: *c_void);
 }
 
