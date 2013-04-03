@@ -173,6 +173,7 @@ pub struct Gc {
     free_buffer: TrieSet,
     precious: TrieSet,
     precious_freed: TrieSet,
+    tls_marked: TrieSet,
     heap: TrieMap<HeapRecord>,
     lowest: uint,
     highest: uint,
@@ -259,9 +260,10 @@ pub impl Gc {
         Gc {
             task: t,
             debug_gc: dbg,
-            actually_gc: always_gc ||
-                zealous ||
-                check_flag("RUST_ACTUALLY_GC"),
+            actually_gc: !check_flag("RUST_INHIBIT_GC") &&
+                (always_gc ||
+                 zealous ||
+                 check_flag("RUST_ACTUALLY_GC")),
             gc_zeal: zealous,
             report_gc_stats: dbg ||
                 check_flag("RUST_REPORT_GC_STATS"),
@@ -273,6 +275,7 @@ pub impl Gc {
             free_buffer: TrieSet::new(),
             precious:  TrieSet::new(),
             precious_freed:  TrieSet::new(),
+            tls_marked:  TrieSet::new(),
             heap: TrieMap::new(),
             lowest: 0,
             highest: 0,
@@ -506,6 +509,22 @@ pub impl Gc {
                 self.debug_uint(self.threshold * 4);
                 self.debug_str("\n");
                 self.threshold *= 4;
+            }
+            if self.debug_gc {
+                let x = self.threshold;
+                self.threshold *= 100;
+                self.actually_gc = false;
+                self.debug_gc = false;
+                for self.tls_marked.each |p| {
+                    Gc::write_str_hex("TLS-marked box", *p);
+                    Gc::stderr_fd().write_str("\n---\n");
+                    unsafe { Gc::debug_opaque_box(*p); }
+                    Gc::stderr_fd().write_str("\n---\n");
+                }
+                self.tls_marked.clear();
+                self.debug_gc = true;
+                self.actually_gc = true;
+                self.threshold = x;
             }
             unsafe {
                 if ! self.precious_freed.is_empty() {
@@ -800,6 +819,7 @@ pub impl Gc {
             } else {
                 self.debug_str_range("  marked via TLS",
                                      addr, sz);
+                self.tls_marked.insert(addr);
             }
         }
         let adj = 32; //size_of::<BoxHeaderRepr>();
@@ -946,6 +966,7 @@ pub impl Gc {
         if self.debug_gc {
             self.debug_gc = false;
             self.report_gc_stats = false;
+            let x = self.actually_gc;
             self.actually_gc = false;
 
             Gc::write_str_hex("registered precious pointer",
@@ -954,8 +975,8 @@ pub impl Gc {
             Gc::debug_opaque_box(addr);
             Gc::stderr_fd().write_str("\n---\n");
 
+            self.actually_gc = x;
             self.report_gc_stats = true;
-            self.actually_gc = true;
             self.debug_gc = true;
         }
         self.precious.insert(addr);

@@ -362,7 +362,6 @@ pub struct ident_interner {
 
 pub impl ident_interner {
     fn intern(&self, val: @~str) -> ast::ident {
-        cleanup::set_precious(val);
         let len0 = self.interner.len();
         let v = self.interner.intern(val);
         let len1 = self.interner.len();
